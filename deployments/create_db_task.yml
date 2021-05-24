@@ -1,0 +1,92 @@
+# redashのcreate_dbタスク実行用Cfnです.
+# これはredash実行に必要なDBの初期化のためのタスクを生成します
+AWSTemplateFormatVersion: 2010-09-09
+Description: redash
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prd
+  ProjectName: #対象ECSのプロジェクト,クラスタ名など
+    Type: String
+    Default: redash-dev
+  ExecuteRoleArn:
+    Type: String
+    Default: DUMMY_EXECUTE_ROLE_ARN
+Mappings:
+  Common:
+    Redash:
+      DockerImage: redash/redash:8.0.0.b32245
+  dev:
+    RDS:
+      User: DUMMY_USER
+      Pass: DUMMY_PASS
+      Endpoint: DUMMY_REDASH_ENDPOINT
+      DB: DUMMY_DB_NAME
+    Redis:
+      Endpoint: DUMMY_REDIS_ENDPOINT
+      Port: 6379
+  prd:
+    RDS:
+      User: DUMMY_USER
+      Pass: DUMMY_PASS
+      Endpoint: DUMMY_REDASH_ENDPOINT
+      DB: DUMMY_DB_NAME
+    Redis:
+      Endpoint: DUMMY_REDIS_ENDPOINT
+      Port: 6379
+Resources:
+  # -------------------- All Task定義 --------------------
+  CreateDBTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Sub ${ProjectName}-create_db
+      RequiresCompatibilities:
+        - 'FARGATE'
+      NetworkMode: 'awsvpc'
+      ExecutionRoleArn: !Sub ${ExecuteRoleArn}
+      Cpu: 4096
+      Memory: 16384
+      ContainerDefinitions:
+        - Image: !FindInMap [ Common, Redash, DockerImage ]
+          Name: !Sub ${ProjectName}-create_db-container
+          Command:
+            - 'create_db'
+          Environment:
+            - Name: 'PYTHONUNBUFFERED'
+              Value: '0'
+            - Name: 'REDASH_ALLOW_SCRIPTS_IN_USER_INPUT'
+              Value: 'true'
+            - Name: 'REDASH_DATABASE_URL'
+              Value: !Sub
+                - postgresql://${User}:${Pass}@${Endpoint}/${DB}
+                - User: !FindInMap [ !Ref Env, RDS, User ]
+                  Pass: !FindInMap [ !Ref Env, RDS, Pass ]
+                  Endpoint: !FindInMap [ !Ref Env, RDS, Endpoint ]
+                  DB: !FindInMap [ !Ref Env, RDS, DB ]
+            - Name: 'REDASH_REDIS_URL'
+              Value: !Sub
+                - redis://${Endpoint}:${Port}/0
+                - Endpoint: !FindInMap [ !Ref Env, Redis, Endpoint ]
+                  Port: !FindInMap [ !Ref Env, Redis, Port ]
+            - Name: 'REDASH_HOST'
+              Value: ''
+            - Name: 'REDASH_DATE_FORMAT'
+              Value: 'YY/MM/DD'
+            - Name: 'REDASH_LOG_LEVEL'
+              Value: 'INFO'
+            - Name: 'REDASH_PASSWORD_LOGIN_ENABLED'
+              Value: false
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group: !Sub /ecs/${ProjectName}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: 'create_db'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-create_db
+        - Key: Group
+          Value: !Sub ${ProjectName}

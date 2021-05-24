@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: redash
+Parameters:
+  Env: # Env指定(任意)
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prd
+  ProjectName:
+    Type: String
+    Default: redash-dev # 名称は任意なので自由に設定できます
+    AllowedValues:
+      - redash-dev
+      - redash-prd
+Mappings:
+  Common:
+    Redash:
+      VpcId: DUMMY_VPC_ID
+      DockerImage: redash/redash:8.0.0.b32245
+      HostZoneId: DUMMY_ZONE_ID
+      HostZoneDomain: DUMMY_DOMAIN
+      ACMArn: DUMMY_ACM_ARN
+  dev: # dev用
+    Redash:
+      SubnetIds:
+        - DUMMY_SUBNET_ID1 # ALB,ECS等のSubnetId
+        - DUMMY_SUBNET_ID2
+      ALBSecurityGroupId: DUMMY_ALB_SECURITY_GROUP_ID # ALB用SecurityGroupOd
+      AllTaskSecurityGroupId: ALL_TASK_SECURITY_GROUP_ID  # ECS用SecurityGroupId
+      SubDomain: DUMMY_SUB_DOMAIN # Route53のドメインで使用するSubDomain
+      CookieSecret: DUMMY_DB_COOKIE_SECRET # redashのDBの暗号化フィールドの復号化で使用
+      SecretKey: DUMMY_DB_SECRET_KEY
+    RDS:
+      User: DUMMY_USER
+      Pass: DUMMY_PASSWOR
+      Endpoint: DUMMY_DB_ENDPOINT
+    Redis:
+      Endpoint: DUMMY_REDIS_ENDPOINT
+      Port: 6379
+  prd: #　prd用
+    Redash:
+      SubnetIds:
+        - DUMMY_SUBNET_ID1
+        - DUMMY_SUBNET_ID2
+      ALBSecurityGroupId: DUMMY_ALB_SECURITY_GROUP_ID
+      AllTaskSecurityGroupId: ALL_TASK_SECURITY_GROUP_ID
+      SubDomain: DUMMY_SUB_DOMAIN
+      CookieSecret: DUMMY_DB_COOKIE_SECRET # redashのDBの暗号化フィールドの復号化で使用
+      SecretKey: DUMMY_DB_SECRET_KEY
+    RDS:
+      User: DUMMY_USER
+      Pass: DUMMY_PASSWOR
+      Endpoint: DUMMY_DB_ENDPOINT
+    Redis:
+      Endpoint: DUMMY_REDIS_ENDPOINT
+      Port: 6379
+Conditions:
+  IsPrd: !Equals [ !Ref Env, prd ]
+Resources:
+  # --------------------  ECS Cluster  --------------------
+  RedashECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Sub ${ProjectName}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}
+        - Key: Group
+          Value: !Sub ${ProjectName}
+  #  -------------------- Task ExecutionRole  --------------------
+  TascExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-execution-role
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-execution-role
+        - Key: Group
+          Value: !Sub ${ProjectName}
+  # -------------------- ALB --------------------
+  ALB: #
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Scheme: internet-facing #　公開したくない場合はinternalで
+      SecurityGroups:
+        - !FindInMap [ !Ref Env, Redash, ALBSecurityGroupId ]
+      Subnets: !FindInMap [ !Ref Env, Redash, SubnetIds ]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb
+        - Key: Group
+          Value: !Sub ${ProjectName}
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg
+      VpcId: !FindInMap [ Common, Redash, VpcId ]
+      Protocol: HTTP
+      Port: 5000
+      TargetType: ip
+      HealthCheckPath: /ping
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-tg
+        - Key: Group
+          Value: !Sub ${ProjectName}
+  # ACMは手動作成したものを使用しています.
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - ALBTargetGroup
+      - ALB
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !FindInMap [ Common, Redash, ACMArn ]
+      SslPolicy: ELBSecurityPolicy-2016-08
+      DefaultActions:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          Type: forward
+  # -------------------- Route53 RecordSet --------------------------
+  # HostZoneはCfn外で管理しています。
+
+  RedashRoute53:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - ALBListener
+    Properties:
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+        DNSName: !GetAtt ALB.DNSName
+      HostedZoneId: !FindInMap [ Common, Redash, HostZoneId ] #Replacement
+      Name: !Sub #Replacement
+        - ${SubDomain}.${HostZoneDomain}
+        - SubDomain: !FindInMap [ !Ref Env, Redash, SubDomain ]
+          HostZoneDomain: !FindInMap [ Common, Redash, HostZoneDomain ]
+
+  # -------------------- All Task定義 --------------------
+  ALLTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      Cpu: 4096
+      Memory: 16384
+      Family: !Sub ${ProjectName}-all-task
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TascExecutionRole.Arn
+      ContainerDefinitions:
+        # server
+        - Image: !FindInMap [ Common, Redash, DockerImage ]
+          Name: !Sub ${ProjectName}-server-container
+          EntryPoint:
+            - /app/bin/docker-entrypoint
+          WorkingDirectory: /app
+          Command:
+            - 'server'
+          Environment:
+            - Name: 'PYTHONUNBUFFERED'
+              Value: '0'
+            - Name: 'REDASH_ALLOW_SCRIPTS_IN_USER_INPUT'
+              Value: 'true'
+            - Name: 'REDASH_COOKIE_SECRET'
+              Value: !FindInMap [ !Ref Env, Redash, CookieSecret ]
+            - Name: 'REDASH_SECRET_KEY'
+              Value: !FindInMap [ !Ref Env, Redash, SecretKey ]
+            - Name: 'REDASH_DATABASE_URL'
+              Value: !Sub
+                - postgresql://${RDSUser}:${RDSPass}@${RDSEndpoint}/postgres
+                - RDSUser: !FindInMap [ !Ref Env, RDS, User ]
+                  RDSPass: !FindInMap [ !Ref Env, RDS, Pass ]
+                  RDSEndpoint: !FindInMap [ !Ref Env, RDS, Endpoint ]
+            - Name: 'REDASH_REDIS_URL'
+              Value: !Sub
+                - redis://${ElasticCacheEndpoint}:${ElasticCachePort}/0
+                - ElasticCacheEndpoint: !FindInMap [ !Ref Env, Redis, Endpoint ]
+                  ElasticCachePort: !FindInMap [ !Ref Env, Redis, Port ]
+            - Name: 'REDASH_HOST'
+              Value: ''
+            - Name: 'REDASH_DATE_FORMAT'
+              Value: 'YY/MM/DD'
+            - Name: 'REDASH_LOG_LEVEL'
+              Value: !If [ IsPrd, 'INFO', 'DEBUG' ]
+            - Name: 'REDASH_WEB_WORKERS'
+              Value: '1'
+            - Name: 'REDASH_CSV_WRITER_ENCODING'
+              Value: 'cp932'
+          PortMappings:
+            - ContainerPort: 5000
+              HostPort: 5000
+              Protocol: 'tcp'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-create-group: true
+              awslogs-group: !Sub /ecs/${ProjectName}
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: 'server'
+        # scheduler
+        - Image: !FindInMap [ Common, Redash, DockerImage ]
+          Name: !Sub ${ProjectName}-scheduler-container
+          EntryPoint:
+            - /app/bin/docker-entrypoint
+          WorkingDirectory: /app
+          Command:
+            - 'scheduler'
+          Environment:
+            - Name: 'PYTHONUNBUFFERED'
+              Value: '0'
+            - Name: 'REDASH_ALLOW_SCRIPTS_IN_USER_INPUT'
+              Value: 'true'
+            - Name: 'REDASH_COOKIE_SECRET'
+              Value: !FindInMap [ !Ref Env, Redash, CookieSecret ]
+            - Name: 'REDASH_SECRET_KEY'
+              Value: !FindInMap [ !Ref Env, Redash, SecretKey ]
+            - Name: 'QUEUES'
+              Value: 'celery'
+            - Name: 'REDASH_DATABASE_URL'
+              Value: !Sub
+                - postgresql://${RDSUser}:${RDSPass}@${RDSEndpoint}/postgres
+                - RDSUser: !FindInMap [ !Ref Env, RDS, User ]
+                  RDSPass: !FindInMap [ !Ref Env, RDS, Pass ]
+                  RDSEndpoint: !FindInMap [ !Ref Env, RDS, Endpoint ]
+            - Name: 'REDASH_REDIS_URL'
+              Value: !Sub
+                - redis://${ElasticCacheEndpoint}:${ElasticCachePort}/0
+                - ElasticCacheEndpoint: !FindInMap [ !Ref Env, Redis, Endpoint ]
+                  ElasticCachePort: !FindInMap [ !Ref Env, Redis, Port ]
+            - Name: 'REDASH_HOST'
+              Value: ''
+            - Name: 'REDASH_DATE_FORMAT'
+              Value: 'YY/MM/DD'
+            - Name: 'REDASH_LOG_LEVEL'
+              Value: !If [ IsPrd, 'INFO', 'DEBUG' ]
+            - Name: 'WORKERS_COUNT'
+              Value: '1'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-create-group: true
+              awslogs-group: !Sub /ecs/${ProjectName}
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: 'scheduler'
+        # worker
+        - Image: !FindInMap [ Common, Redash, DockerImage ]
+          Name: !Sub ${ProjectName}-worker-container
+          EntryPoint:
+            - /app/bin/docker-entrypoint
+          WorkingDirectory: /app
+          Command:
+            - 'worker'
+          Environment:
+            - Name: 'PYTHONUNBUFFERED'
+              Value: '0'
+            - Name: 'REDASH_ALLOW_SCRIPTS_IN_USER_INPUT'
+              Value: 'true'
+            - Name: 'REDASH_COOKIE_SECRET'
+              Value: !FindInMap [ !Ref Env, Redash, CookieSecret ]
+            - Name: 'REDASH_SECRET_KEY'
+              Value: !FindInMap [ !Ref Env, Redash, SecretKey ]
+            - Name: 'QUEUES'
+              Value: 'queries,scheduled_queries,schemas'
+            - Name: 'REDASH_DATABASE_URL'
+              Value: !Sub
+                - postgresql://${RDSUser}:${RDSPass}@${RDSEndpoint}/postgres
+                - RDSUser: !FindInMap [ !Ref Env, RDS, User ]
+                  RDSPass: !FindInMap [ !Ref Env, RDS, Pass ]
+                  RDSEndpoint: !FindInMap [ !Ref Env, RDS, Endpoint ]
+            - Name: 'REDASH_REDIS_URL'
+              Value: !Sub
+                - redis://${ElasticCacheEndpoint}:${ElasticCachePort}/0
+                - ElasticCacheEndpoint: !FindInMap [ !Ref Env, Redis, Endpoint ]
+                  ElasticCachePort: !FindInMap [ !Ref Env, Redis, Port ]
+            - Name: 'REDASH_HOST'
+              Value: ''
+            - Name: 'REDASH_DATE_FORMAT'
+              Value: 'YY/MM/DD'
+            - Name: 'REDASH_LOG_LEVEL'
+              Value: !If [ IsPrd, 'INFO', 'DEBUG' ]
+            - Name: 'WORKERS_COUNT'
+              Value: '3'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-create-group: true
+              awslogs-group: !Sub /ecs/${ProjectName}
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: 'worker'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-all-task
+        - Key: Group
+          Value: !Sub ${ProjectName}
+  # ------------------------ Service ------------------------
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALLTaskDefinition
+      - ALBListener
+    Properties:
+      Cluster: !Sub ${ProjectName}
+      ServiceName: !Sub ${ProjectName}-all-task-service
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: !Sub ${ProjectName}-server-container
+          ContainerPort: 5000
+          TargetGroupArn: !Ref ALBTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !FindInMap [ !Ref Env, Redash, AllTaskSecurityGroupId ]
+          Subnets: !FindInMap [ !Ref Env, Redash, SubnetIds ]
+          AssignPublicIp: ENABLED
+      TaskDefinition: !Ref ALLTaskDefinition
+      PropagateTags: TASK_DEFINITION
+      EnableECSManagedTags: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-service
+        - Key: Group
+          Value: !Sub ${ProjectName}

@@ -1,0 +1,7 @@
+## Directory-based project format:
+.idea/
+
+### OSX ###
+.DS_Store
+.AppleDouble
+.LSOverride
