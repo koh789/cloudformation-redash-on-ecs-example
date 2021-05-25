@@ -22,3 +22,13 @@ https://redash.io/integrations/
 * Route53(HostZoneId)   : RedashのWEB,API用ドメイン
 * Certificate Manager   : WEB,API用
 * ScurityGroup          : ALB,ECS用
+
+## cli
+
+create db task
+
+`make cfn-deploy-create-db-task ENV=dev`
+
+deploy ecs 
+
+`make cfn-dev-deploy`
